@@ -98,6 +98,24 @@ it.layer(PgContainer.layer, { timeout: "30 seconds" })("PgConnection", (it) => {
       yield* Fiber.join(closing)
     }).pipe(TestClock.withLive))
 
+  it.effect("keeps the session when UNLISTEN is sent before a pin release", () =>
+    Effect.gen(function*() {
+      const connection = yield* makeConnection()
+      const pinScope = yield* Scope.make()
+      const pinned = yield* Scope.provide(connection.pin, pinScope)
+      const listenScope = yield* Scope.make()
+      yield* Scope.provide(pinned.listen("sent_listener"), listenScope)
+      const closing = yield* Effect.forkDetach(Effect.andThen(Effect.yieldNow, Scope.close(listenScope, Exit.void)))
+      yield* pinned.query("SELECT pg_sleep(0.05)")
+      // Let the queued UNLISTEN take the wire before the pin is released.
+      yield* Effect.yieldNow
+
+      yield* Scope.close(pinScope, Exit.void)
+      const result = yield* connection.query("SELECT 1 AS one").pipe(Effect.timeout("2 seconds"))
+      assert.deepStrictEqual(result.rows, [{ one: 1 }])
+      yield* Fiber.join(closing)
+    }).pipe(TestClock.withLive))
+
   it.effect("connects through ReadyForQuery", () =>
     Effect.gen(function*() {
       const connection = yield* makeConnection()
