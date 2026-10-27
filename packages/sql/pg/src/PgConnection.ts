@@ -771,23 +771,21 @@ class PgConnectionImpl implements PgConnection {
         ))
     ),
     (view) =>
-      Effect.flatMap(
-        Effect.suspend(() => {
-          view.released = true
-          this.pinned = false
-          return this.wire.takeIfAvailable(1)
-        }),
-        (idle) => {
-          // Retire rather than wait indefinitely for leaked work to finish.
-          if (!idle || view.listeners > 0) {
-            this.fatal(connectionQueryError(
-              new Error("Pinned connection released with work outstanding"),
-              "PgConnection: Pinned connection released with work outstanding"
-            ))
-          }
-          return idle ? Effect.andThen(this.wire.release(1), this.owner.release(1)) : this.owner.release(1)
+      Effect.suspend(() => {
+        view.released = true
+        this.pinned = false
+        // Retire rather than wait indefinitely for leaked work to finish.
+        if (view.active > 0 || view.listeners > 0) {
+          this.fatal(connectionQueryError(
+            new Error("Pinned connection released with work outstanding"),
+            "PgConnection: Pinned connection released with work outstanding"
+          ))
+          return this.owner.release(1)
         }
-      ),
+        // Anything else holding the wire is listener cleanup, whose UNLISTEN is
+        // bounded by its own timeout, or work that sees `released` and fails.
+        return Effect.andThen(this.wire.withPermit(Effect.void), this.owner.release(1))
+      }),
     { interruptible: true }
   )
 
@@ -838,6 +836,8 @@ class PinnedPgConnection implements PgConnection {
   readonly pin: Effect.Effect<PinnedPgConnection, never, Scope.Scope>
   released = false
   listeners = 0
+  /** Statements and streams holding the wire through this view. */
+  active = 0
 
   constructor(base: PgConnectionImpl) {
     this.base = base
@@ -855,9 +855,21 @@ class PinnedPgConnection implements PgConnection {
     return this.base.wire.withPermit(Effect.suspend(() =>
       this.released
         ? Effect.fail(pinReleasedError())
-        : this.base.cycleOwned(sql, params, wantRows, prepare ? this.base.prepared : undefined)
+        : Effect.acquireUseRelease(
+          this.track,
+          () => this.base.cycleOwned(sql, params, wantRows, prepare ? this.base.prepared : undefined),
+          () => this.untrack
+        )
     ))
   }
+
+  readonly track: Effect.Effect<void> = Effect.sync(() => {
+    this.active++
+  })
+
+  readonly untrack: Effect.Effect<void> = Effect.sync(() => {
+    this.active--
+  })
 
   readonly interrupt: Effect.Effect<void> = Effect.suspend(() => this.released ? Effect.void : this.base.cancel)
 
@@ -1696,6 +1708,7 @@ const streamRows = (
     )
     if (conn.deadWith !== undefined) return yield* conn.deadWith
     if (pinned.released) return yield* pinReleasedError()
+    yield* Scope.provide(Effect.acquireRelease(pinned.track, () => pinned.untrack), scope)
     // Streams stay on the unnamed path: a stream pays its setup once over the
     // whole result, so naming the statement buys little and would need the
     // stale-plan retry to unwind rows already delivered.
